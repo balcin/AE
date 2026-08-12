@@ -39,6 +39,7 @@ void PCReceive_Task(void* pvParameters);
 void PCSend_Task(void* pvParameters);
 void TemperatureDisplay_Task(void* pvParameters);
 int8_t CalculateTemperature(uint8_t resistance);
+uint8_t TemperatureToLEDPattern(int8_t temperature);
 
 // TRASNMISSION DATA - CONSTANT IN THIS APPLICATION 
 const char trigger[] = "XYZ";
@@ -65,6 +66,8 @@ SemaphoreHandle_t RXC_PC_Semaphore;
 
 QueueHandle_t LEDBar_Queue;
 QueueHandle_t Sensor_Queue;
+/* STEP 2: Added queue for temperature data */
+QueueHandle_t Temperature_Queue;
 QueueHandle_t PCSend_Queue;
 
 // STRUCTURES
@@ -74,6 +77,14 @@ typedef struct
 	uint8_t resistance;
 
 } SensorData;
+
+/* STEP 1: Added structure for temperature data */
+typedef struct
+{
+	uint8_t channel;
+	int8_t temperature;
+
+} TemperatureData;
 
 uint8_t sensor0_values[5];
 uint8_t sensor1_values[5];
@@ -122,6 +133,36 @@ int8_t CalculateTemperature(uint8_t resistance)
 
 
 	return (int8_t)temperature;
+}
+
+uint8_t TemperatureToLEDPattern(int8_t temperature)
+{
+	uint8_t led_count;
+	uint8_t pattern;
+
+	if (temperature <= 0)
+	{
+		led_count = 0U;
+	}
+	else if (temperature >= 80)
+	{
+		led_count = 8U;
+	}
+	else
+	{
+		led_count = (uint8_t)(((int16_t)temperature * 8) / 80);
+	}
+
+	if (led_count == 0U)
+	{
+		pattern = 0x00U;
+	}
+	else
+	{
+		pattern = (uint8_t)((1U << led_count) - 1U);
+	}
+
+	return pattern;
 }
 
 int8_t ParseTemperatureValue(const char* command, uint8_t start_index
@@ -262,6 +303,8 @@ void main_demo(void) {
 	// QUEUES
 	LEDBar_Queue = xQueueCreate(2, sizeof(uint8_t));
 	Sensor_Queue = xQueueCreate(10, sizeof(SensorData));
+	/* STEP 3: Create queue for temperature data */
+	Temperature_Queue = xQueueCreate(10, sizeof(TemperatureData));
 	PCSend_Queue = xQueueCreate(5, sizeof(char[32]));
 
 	// TASKS 
@@ -281,14 +324,77 @@ void main_demo(void) {
 }
 
 // TASKS: IMPLEMENTATIONS
-void LEDBar_Task(void* pvParameters) {
-	uint8_t LEDsPattern;
-	while (1) {
-		xQueueReceive(LEDBar_Queue, &LEDsPattern, portMAX_DELAY);
-		set_LED_BAR(0, LEDsPattern);
+void LEDBar_Task(void* pvParameters)
+{
+	TemperatureData data;
+
+	int8_t temp_inside = 0;
+	int8_t temp_outside = 0;
+
+	uint8_t alarm_state = 0U;
+
+	while (1)
+	{
+
+
+		if (xQueueReceive(
+			Temperature_Queue,
+			&data,
+			0) == pdTRUE)
+		{
+			if (data.channel == SENSOR_IN_CH)
+			{
+				temp_inside = data.temperature;
+			}
+			else if (data.channel == SENSOR_OUT_CH)
+			{
+				temp_outside = data.temperature;
+			}
+
+			/* STEP 8: Display temperatures on LED bars */
+			set_LED_BAR(
+				1,
+				TemperatureToLEDPattern(temp_inside)
+			);
+
+			set_LED_BAR(
+				2,
+				TemperatureToLEDPattern(temp_outside)
+			);
+
+			printf(
+				"LED TASK: unutrasnja=%d C, spoljasnja=%d C\n",
+				(int)temp_inside,
+				(int)temp_outside
+			);
+		}
+
+		/* STEP 7: Check temperature limits and blink first LED bar */
+		if ((temp_inside < temperature_low_limit) ||
+			(temp_inside > temperature_high_limit) ||
+			(temp_outside < temperature_low_limit) ||
+			(temp_outside > temperature_high_limit))
+		{
+			if (alarm_state == 0U)
+			{
+				set_LED_BAR(0, 0xFFU);
+				alarm_state = 1U;
+			}
+			else
+			{
+				set_LED_BAR(0, 0x00U);
+				alarm_state = 0U;
+			}
+		}
+		else
+		{
+			set_LED_BAR(0, 0x00U);
+			alarm_state = 0U;
+		}
+
+		vTaskDelay(pdMS_TO_TICKS(500));
 	}
 }
-
 void SerialSend_Task(void* pvParameters) {
 	t_point = 0;
 	while (1) {
@@ -454,8 +560,7 @@ void SerialReceive_Task(void* pvParameters)
 void TemperatureProcess_Task(void* pvParameters)
 {
 	SensorData data;
-
-	(void)pvParameters;
+	TemperatureData temperature_data;
 
 	while (1)
 	{
@@ -465,75 +570,34 @@ void TemperatureProcess_Task(void* pvParameters)
 			portMAX_DELAY
 		);
 
+		temperature_data.channel = data.channel;
+		temperature_data.temperature =
+			CalculateTemperature(data.resistance);
+
 		if (data.channel == SENSOR_IN_CH)
 		{
-			sensor0_values[index0] = data.resistance;
-
-			index0++;
-
-			if (index0 >= 5U)
-			{
-				index0 = 0U;
-			}
-
-			if (sensor0_count < 5U)
-			{
-				sensor0_count++;
-			}
-
-			average_resistance_ch0 =
-				CalculateAverage(
-					sensor0_values,
-					sensor0_count
-				);
-
-			temperature_ch0 =
-				CalculateTemperature(
-					average_resistance_ch0
-				);
-
-			printf(
-				"Senzor kanal 0: R=%u ohm T=%d C\n",
-				(unsigned)average_resistance_ch0,
-				(int)temperature_ch0
-			);
+			temperature_ch0 = temperature_data.temperature;
 		}
 		else if (data.channel == SENSOR_OUT_CH)
 		{
-			sensor1_values[index1] = data.resistance;
-
-			index1++;
-
-			if (index1 >= 5U)
-			{
-				index1 = 0U;
-			}
-
-			if (sensor1_count < 5U)
-			{
-				sensor1_count++;
-			}
-
-			average_resistance_ch1 =
-				CalculateAverage(
-					sensor1_values,
-					sensor1_count
-				);
-
-			temperature_ch1 =
-				CalculateTemperature(
-					average_resistance_ch1
-				);
-
-			printf(
-				"Senzor kanal 1: R=%u ohm T=%d C\n",
-				(unsigned)average_resistance_ch1,
-				(int)temperature_ch1
-			);
+			temperature_ch1 = temperature_data.temperature;
 		}
+
+		printf(
+			"Kanal %u: R=%u ohm, T=%d C\n",
+			(unsigned)data.channel,
+			(unsigned)data.resistance,
+			(int)temperature_data.temperature
+		);
+
+		/* STEP 4: Send calculated temperature to temperature queue */
+		xQueueSend(
+			Temperature_Queue,
+			&temperature_data,
+			portMAX_DELAY
+		);
 	}
 }
-
 
 void SensorTrigger_Task(void* pvParameters)
 {
