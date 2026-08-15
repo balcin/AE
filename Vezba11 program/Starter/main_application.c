@@ -27,7 +27,7 @@
 #define TASK_SERIAl_REC_PRI			( tskIDLE_PRIORITY + 3 )
 #define	SERVICE_TASK_PRI			( tskIDLE_PRIORITY + 1 )
 #define TASK_TEMP_PROCESS_PRI       ( tskIDLE_PRIORITY + 2 )
-
+#define TASK_LCD_PRI (tskIDLE_PRIORITY + 1)
 
 // TASKS: FORWARD DECLARATIONS 
 void LEDBar_Task(void* pvParameters);
@@ -38,6 +38,8 @@ void SensorTrigger_Task(void* pvParameters);
 void PCReceive_Task(void* pvParameters);
 void PCSend_Task(void* pvParameters);
 void TemperatureDisplay_Task(void* pvParameters);
+void LCDDisplay_Task(void* pvParameters);
+static void LCDTimerCallback(TimerHandle_t xTimer);
 int8_t CalculateTemperature(uint8_t resistance);
 uint8_t TemperatureToLEDPattern(int8_t temperature);
 
@@ -63,12 +65,16 @@ SemaphoreHandle_t TBE_CH1_BinarySemaphore;
 SemaphoreHandle_t RXC_CH0_Semaphore;
 SemaphoreHandle_t RXC_CH1_Semaphore;
 SemaphoreHandle_t RXC_PC_Semaphore;
+SemaphoreHandle_t LCD_BinarySemaphore;
 
 QueueHandle_t LEDBar_Queue;
 QueueHandle_t Sensor_Queue;
 /* STEP 2: Added queue for temperature data */
 QueueHandle_t Temperature_Queue;
 QueueHandle_t PCSend_Queue;
+QueueHandle_t LCD_Queue;
+
+TimerHandle_t LCD_Timer;
 
 // STRUCTURES
 typedef struct
@@ -85,6 +91,14 @@ typedef struct
 	int8_t temperature;
 
 } TemperatureData;
+
+typedef struct
+{
+	uint8_t resistance_inside;
+	uint8_t resistance_outside;
+	int8_t temperature_inside;
+	int8_t temperature_outside;
+} LCDData;
 
 uint8_t sensor0_values[5];
 uint8_t sensor1_values[5];
@@ -275,7 +289,7 @@ static uint32_t prvProcessRXCInterrupt(void)
 // MAIN - SYSTEM STARTUP POINT 
 void main_demo(void) {
 	// INITIALIZATION OF THE PERIPHERALS
-	//init_7seg_comm();
+	init_7seg_comm();
 	init_LED_comm();
 	init_serial_uplink(SENSOR_IN_CH);		// inicijalizacija serijske TX na kanalu 0
 	init_serial_downlink(SENSOR_IN_CH);	// inicijalizacija serijske RX na kanalu 0
@@ -300,12 +314,23 @@ void main_demo(void) {
 
 	RXC_PC_Semaphore = xSemaphoreCreateBinary();
 
+	LCD_BinarySemaphore = xSemaphoreCreateBinary();
+
+	LCD_Timer = xTimerCreate(
+		"LCDTimer",
+		pdMS_TO_TICKS(100),
+		pdTRUE,
+		NULL,
+		LCDTimerCallback
+	);
+
 	// QUEUES
 	LEDBar_Queue = xQueueCreate(2, sizeof(uint8_t));
 	Sensor_Queue = xQueueCreate(10, sizeof(SensorData));
 	/* STEP 3: Create queue for temperature data */
 	Temperature_Queue = xQueueCreate(10, sizeof(TemperatureData));
 	PCSend_Queue = xQueueCreate(5, sizeof(char[32]));
+	LCD_Queue = xQueueCreate(1, sizeof(LCDData));
 
 	// TASKS 
 	/* xTaskCreate(SerialSend_Task, "STx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAL_SEND_PRI, NULL);	// SERIAL TRANSMITTER TASK */
@@ -317,6 +342,11 @@ void main_demo(void) {
 	xTaskCreate(PCReceive_Task, "PCRx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAl_REC_PRI, NULL);
 	xTaskCreate(PCSend_Task, "PCTx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAL_SEND_PRI, NULL);
 	xTaskCreate(TemperatureDisplay_Task, "TempDisplay", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAL_SEND_PRI, NULL);
+	xTaskCreate(LCDDisplay_Task, "LCD", configMINIMAL_STACK_SIZE, NULL, TASK_LCD_PRI, NULL);
+	if (LCD_Timer != NULL)
+	{
+		(void)xTimerStart(LCD_Timer, 0U);
+	}
 
 	// START SCHEDULER
 	vTaskStartScheduler();
@@ -562,40 +592,125 @@ void TemperatureProcess_Task(void* pvParameters)
 	SensorData data;
 	TemperatureData temperature_data;
 
+	LCDData lcd_data =
+	{
+		0U,
+		0U,
+		0,
+		0
+	};
+
+	(void)pvParameters;
+
 	while (1)
 	{
-		xQueueReceive(
+		if (xQueueReceive(
 			Sensor_Queue,
 			&data,
 			portMAX_DELAY
-		);
-
-		temperature_data.channel = data.channel;
-		temperature_data.temperature =
-			CalculateTemperature(data.resistance);
-
-		if (data.channel == SENSOR_IN_CH)
+		) == pdTRUE)
 		{
-			temperature_ch0 = temperature_data.temperature;
-		}
-		else if (data.channel == SENSOR_OUT_CH)
-		{
-			temperature_ch1 = temperature_data.temperature;
-		}
+			temperature_data.channel = data.channel;
 
-		printf(
-			"Kanal %u: R=%u ohm, T=%d C\n",
-			(unsigned)data.channel,
-			(unsigned)data.resistance,
-			(int)temperature_data.temperature
-		);
+			if (data.channel == SENSOR_IN_CH)
+			{
+				/* Sacuvaj novo ocitavanje unutrasnjeg senzora */
+				sensor0_values[index0] = data.resistance;
 
-		/* STEP 4: Send calculated temperature to temperature queue */
-		xQueueSend(
-			Temperature_Queue,
-			&temperature_data,
-			portMAX_DELAY
-		);
+				index0++;
+
+				if (index0 >= 5U)
+				{
+					index0 = 0U;
+				}
+
+				if (sensor0_count < 5U)
+				{
+					sensor0_count++;
+				}
+
+				/* Izracunaj prosjek dostupnih ocitavanja */
+				average_resistance_ch0 = CalculateAverage(
+					sensor0_values,
+					sensor0_count
+				);
+
+				/* Temperaturu racunamo iz prosjecne otpornosti */
+				temperature_ch0 = CalculateTemperature(
+					average_resistance_ch0
+				);
+
+				temperature_data.temperature = temperature_ch0;
+
+				lcd_data.resistance_inside = average_resistance_ch0;
+				lcd_data.temperature_inside = temperature_ch0;
+			}
+			else if (data.channel == SENSOR_OUT_CH)
+			{
+				/* Sacuvaj novo ocitavanje spoljasnjeg senzora */
+				sensor1_values[index1] = data.resistance;
+
+				index1++;
+
+				if (index1 >= 5U)
+				{
+					index1 = 0U;
+				}
+
+				if (sensor1_count < 5U)
+				{
+					sensor1_count++;
+				}
+
+				/* Izracunaj prosjek dostupnih ocitavanja */
+				average_resistance_ch1 = CalculateAverage(
+					sensor1_values,
+					sensor1_count
+				);
+
+				/* Temperaturu racunamo iz prosjecne otpornosti */
+				temperature_ch1 = CalculateTemperature(
+					average_resistance_ch1
+				);
+
+				temperature_data.temperature = temperature_ch1;
+
+				lcd_data.resistance_outside = average_resistance_ch1;
+				lcd_data.temperature_outside = temperature_ch1;
+			}
+			else
+			{
+				/* Neocekivan kanal - podatak se ne obradjuje */
+				continue;
+			}
+
+			printf(
+				"Kanal %u: Ravg=%u ohm, T=%d C\n",
+				(unsigned)data.channel,
+				(unsigned)(
+					(data.channel == SENSOR_IN_CH)
+					? average_resistance_ch0
+					: average_resistance_ch1
+					),
+				(int)temperature_data.temperature
+			);
+
+			/* Posalji temperaturu LED tasku */
+			(void)xQueueSend(
+				Temperature_Queue,
+				&temperature_data,
+				portMAX_DELAY
+			);
+
+			/* LCD-u je potrebna samo najnovija kompletna vrijednost */
+			if (LCD_Queue != NULL)
+			{
+				(void)xQueueOverwrite(
+					LCD_Queue,
+					&lcd_data
+				);
+			}
+		}
 	}
 }
 
@@ -842,6 +957,224 @@ void PCSend_Task(void* pvParameters)
 			);
 
 			i++;
+		}
+	}
+}
+
+static void LCDTimerCallback(TimerHandle_t xTimer)
+{
+	(void)xTimer;
+
+	if (LCD_BinarySemaphore != NULL)
+	{
+		(void)xSemaphoreGive(LCD_BinarySemaphore);
+	}
+}
+
+void LCDDisplay_Task(void* pvParameters)
+{
+	LCDData lcd_data =
+	{
+		0U,
+		0U,
+		0,
+		0
+	};
+
+	uint8_t display_mode = 0U;
+	uint8_t refresh_count = 0U;
+	uint8_t data_available = 0U;
+
+	uint8_t digits[4] =
+	{
+		0U,
+		0U,
+		0U,
+		0U
+	};
+
+	uint8_t value = 0U;
+	uint8_t i;
+
+	(void)pvParameters;
+
+	while (1)
+	{
+		/*
+		 * LCD task ceka semafor koji tajmer
+		 * daje svakih 100 ms.
+		 */
+		if (xSemaphoreTake(
+			LCD_BinarySemaphore,
+			portMAX_DELAY
+		) == pdTRUE)
+		{
+			/*
+			 * Procitaj najnovije podatke iz LCD queue reda.
+			 * xQueuePeek ne uklanja podatak iz reda.
+			 */
+			if (xQueuePeek(
+				LCD_Queue,
+				&lcd_data,
+				0U
+			) == pdTRUE)
+			{
+				data_available = 1U;
+			}
+
+			if (data_available == 1U)
+			{
+				/*
+				 * display_mode:
+				 *
+				 * 0 - unutrasnja otpornost
+				 * 1 - spoljasnja otpornost
+				 * 2 - unutrasnja temperatura
+				 * 3 - spoljasnja temperatura
+				 */
+				switch (display_mode)
+				{
+				case 0U:
+				{
+					/*
+					 * IrXX
+					 * Unutrasnja otpornost
+					 */
+					value = lcd_data.resistance_inside;
+
+					digits[0] = 0x06U; /* I */
+					digits[1] = 0x50U; /* r */
+
+					break;
+				}
+
+				case 1U:
+				{
+					/*
+					 * OrXX
+					 * Spoljasnja otpornost
+					 */
+					value = lcd_data.resistance_outside;
+
+					digits[0] = 0x3FU; /* O */
+					digits[1] = 0x50U; /* r */
+
+					break;
+				}
+
+				case 2U:
+				{
+					/*
+					 * ItXX
+					 * Unutrasnja temperatura
+					 */
+					if (lcd_data.temperature_inside < 0)
+					{
+						value = 0U;
+					}
+					else
+					{
+						value =
+							(uint8_t)lcd_data.temperature_inside;
+					}
+
+					digits[0] = 0x06U; /* I */
+					digits[1] = 0x78U; /* t */
+
+					break;
+				}
+
+				case 3U:
+				{
+					/*
+					 * OtXX
+					 * Spoljasnja temperatura
+					 */
+					if (lcd_data.temperature_outside < 0)
+					{
+						value = 0U;
+					}
+					else
+					{
+						value =
+							(uint8_t)lcd_data.temperature_outside;
+					}
+
+					digits[0] = 0x3FU; /* O */
+					digits[1] = 0x78U; /* t */
+
+					break;
+				}
+
+				default:
+				{
+					display_mode = 0U;
+					value = 0U;
+
+					digits[0] = 0x00U;
+					digits[1] = 0x00U;
+
+					break;
+				}
+				}
+
+				/*
+				 * Za broj koristimo poslednje dvije cifre.
+				 * Najveca vrijednost koju mozemo prikazati je 99.
+				 */
+				if (value > 99U)
+				{
+					value = 99U;
+				}
+
+				/*
+				 * Razlaganje vrijednosti na desetice i jedinice.
+				 */
+				digits[2] = (uint8_t)hexnum[value / 10U];
+				digits[3] = (uint8_t)hexnum[value % 10U];
+
+				/*
+				 * Upis sve cetiri cifre na Seg7Mux.
+				 */
+				for (i = 0U; i < 4U; i++)
+				{
+					(void)select_7seg_digit(i);
+					(void)set_7seg_digit(digits[i]);
+				}
+			}
+			else
+			{
+				/*
+				 * Ako jos nije stiglo nijedno mjerenje,
+				 * ugasi sve cetiri cifre.
+				 */
+				for (i = 0U; i < 4U; i++)
+				{
+					(void)select_7seg_digit(i);
+					(void)set_7seg_digit(0x00U);
+				}
+			}
+
+			/*
+			 * Task se aktivira svakih 100 ms.
+			 * Nakon 10 aktiviranja prosla je jedna sekunda.
+			 */
+			refresh_count++;
+
+			if (refresh_count >= 10U)
+			{
+				refresh_count = 0U;
+				display_mode++;
+
+				/*
+				 * Poslije cetvrtog prikaza
+				 * vrati se na prvi.
+				 */
+				if (display_mode >= 4U)
+				{
+					display_mode = 0U;
+				}
+			}
 		}
 	}
 }
