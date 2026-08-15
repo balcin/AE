@@ -31,7 +31,6 @@ void main_demo(void);
 
 /* Functions used only inside main_application.c. */
 static void LEDBar_Task(void* pvParameters);
-static void SerialSend_Task(void* pvParameters);
 static void SerialReceive_Task(void* pvParameters);
 static void TemperatureProcess_Task(void* pvParameters);
 static void SensorTrigger_Task(void* pvParameters);
@@ -53,18 +52,16 @@ static uint8_t CalculateAverage(
 	uint8_t count
 );
 
-// TRASNMISSION DATA - CONSTANT IN THIS APPLICATION 
-static const char trigger[] = "XYZ";
-static volatile unsigned t_point;
-
-// RECEPTION DATA BUFFER - COM 0
-#define R_BUF_SIZE (32)
-static uint8_t r_buffer[R_BUF_SIZE];
-static volatile unsigned r_point;
 
 
 // 7-SEG NUMBER DATABASE - ALL HEX DIGITS [ 0 1 2 3 4 5 6 7 8 9 A B C D E F ]
-static const char hexnum[] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71 };
+static const uint8_t hexnum[16] =
+{
+	0x3FU, 0x06U, 0x5BU, 0x4FU,
+	0x66U, 0x6DU, 0x7DU, 0x07U,
+	0x7FU, 0x6FU, 0x77U, 0x7CU,
+	0x39U, 0x5EU, 0x79U, 0x71U
+};
 
 
 // GLOBAL OS-HANDLES 
@@ -77,7 +74,6 @@ static SemaphoreHandle_t RXC_CH1_Semaphore;
 static SemaphoreHandle_t RXC_PC_Semaphore;
 static SemaphoreHandle_t LCD_BinarySemaphore;
 
-static QueueHandle_t LEDBar_Queue;
 static QueueHandle_t Sensor_Queue;
 /* STEP 2: Added queue for temperature data */
 static QueueHandle_t Temperature_Queue;
@@ -142,27 +138,43 @@ static int8_t temperature_low_limit = 10;
 //FUNCTIONS
 static int8_t CalculateTemperature(uint8_t resistance)
 {
-	int16_t temperature;
+	int32_t resistance_value;
+	int32_t minimum_temperature;
+	int32_t maximum_temperature;
+	int32_t temperature_range;
+	int32_t maximum_resistance;
+	int32_t calculated_temperature;
+	int8_t result;
 
+	resistance_value = (int32_t)resistance;
+	minimum_temperature = (int32_t)sensor_min_temp;
+	maximum_temperature = (int32_t)sensor_max_temp;
+	maximum_resistance = (int32_t)SENSOR_MAX_RESISTANCE;
 
-	temperature = sensor_max_temp -
+	temperature_range =
+		maximum_temperature - minimum_temperature;
+
+	calculated_temperature =
+		maximum_temperature -
 		(
-			(
-				(int16_t)resistance *
-				(sensor_max_temp - sensor_min_temp)
-				)
-			/
-			SENSOR_MAX_RESISTANCE
+			(resistance_value * temperature_range)
+			/ maximum_resistance
 			);
 
+	/*
+	 * The calibration limits are stored as int8_t, therefore the
+	 * calculated linear interpolation remains inside the int8_t range.
+	 */
+	result = (int8_t)calculated_temperature;
 
-	return (int8_t)temperature;
+	return result;
 }
 
 static uint8_t TemperatureToLEDPattern(int8_t temperature)
 {
 	uint8_t led_count;
 	uint8_t pattern;
+	uint16_t scaled_temperature = 0U;
 
 	if (temperature <= 0)
 	{
@@ -174,7 +186,16 @@ static uint8_t TemperatureToLEDPattern(int8_t temperature)
 	}
 	else
 	{
-		led_count = (uint8_t)(((int16_t)temperature * 8) / 80);
+		/*
+		 * U ovaj blok se ulazi samo kada je temperatura
+		 * veca od 0 i manja od 80, pa je konverzija
+		 * u unsigned tip bezbjedna.
+		 */
+		scaled_temperature = (uint16_t)temperature;
+		scaled_temperature =
+			(scaled_temperature * 8U) / 80U;
+
+		led_count = (uint8_t)scaled_temperature;
 	}
 
 	if (led_count == 0U)
@@ -192,34 +213,80 @@ static uint8_t TemperatureToLEDPattern(int8_t temperature)
 static int8_t ParseTemperatureValue(const char* command, uint8_t start_index
 )
 {
-	int16_t value = 0;
-	uint8_t i = start_index;
+	uint16_t value = 0U;
+	uint8_t index = start_index;
+	uint8_t current_character;
+	uint8_t digit;
+	int8_t result;
 
-	while ((command[i] >= '0') && (command[i] <= '9'))
+	current_character = (uint8_t)command[index];
+
+	while (
+		(current_character >= (uint8_t)'0') &&
+		(current_character <= (uint8_t)'9')
+		)
 	{
-		value = (value * 10) + (command[i] - '0');
-		i++;
+		digit =
+			current_character - (uint8_t)'0';
+
+		/*
+		 * Najveca dozvoljena vrijednost je 127,
+		 * jer se rezultat cuva kao int8_t.
+		 */
+		if (
+			(value < 12U) ||
+			((value == 12U) && (digit <= 7U))
+			)
+		{
+			value = (value * 10U) + digit;
+		}
+		else
+		{
+			value = 127U;
+		}
+
+		index++;
+		current_character = (uint8_t)command[index];
 	}
 
-	return (int8_t)value;
+	/*
+	 * value je prethodno ogranicen na opseg 0-127,
+	 * pa je konverzija u int8_t bezbjedna.
+	 */
+	result = (int8_t)value;
+
+	return result;
 }
-static uint8_t CalculateAverage(const uint8_t* values, uint8_t count
+static uint8_t CalculateAverage(
+	const uint8_t* values,
+	uint8_t count
 )
 {
 	uint16_t sum = 0U;
-	uint8_t i;
+	uint8_t index;
+	uint8_t result = 0U;
 
-	if (count == 0U)
+	if ((values != NULL) && (count > 0U))
 	{
-		return 0U;
+		for (index = 0U; index < count; index++)
+		{
+			sum += (uint16_t)values[index];
+		}
+
+		result = (uint8_t)(
+			sum / (uint16_t)count
+			);
+	}
+	else
+	{
+		/*
+		 * Nema dostupnih mjerenja ili pokazivac nije validan.
+		 * result ostaje 0U.
+		 */
+		result = 0U;
 	}
 
-	for (i = 0U; i < count; i++)
-	{
-		sum += values[i];
-	}
-
-	return (uint8_t)(sum / count);
+	return result;
 }
 
 // INTERRUPTS //
@@ -234,7 +301,7 @@ static uint32_t prvProcessTBEInterrupt(void)
 {
 	BaseType_t xHigherPTW = pdFALSE;
 
-	if (get_TBE_status(SENSOR_IN_CH))
+	if (get_TBE_status(SENSOR_IN_CH)==1)
 	{
 		xSemaphoreGiveFromISR(
 			TBE_BinarySemaphore,
@@ -242,7 +309,7 @@ static uint32_t prvProcessTBEInterrupt(void)
 		);
 	}
 
-	if (get_TBE_status(SENSOR_OUT_CH))
+	if (get_TBE_status(SENSOR_OUT_CH)==1)
 	{
 		xSemaphoreGiveFromISR(
 			TBE_CH1_BinarySemaphore,
@@ -250,7 +317,7 @@ static uint32_t prvProcessTBEInterrupt(void)
 		);
 	}
 
-	if (get_TBE_status(PC_CH))
+	if (get_TBE_status(PC_CH)==1)
 	{
 		xSemaphoreGiveFromISR(
 			TBE_PC_BinarySemaphore,
@@ -266,7 +333,7 @@ static uint32_t prvProcessRXCInterrupt(void)
 	BaseType_t xHigherPTW = pdFALSE;
 
 
-	if (get_RXC_status(SENSOR_IN_CH))
+	if (get_RXC_status(SENSOR_IN_CH)==1)
 	{
 		xSemaphoreGiveFromISR(
 			RXC_CH0_Semaphore,
@@ -275,7 +342,7 @@ static uint32_t prvProcessRXCInterrupt(void)
 	}
 
 
-	if (get_RXC_status(SENSOR_OUT_CH))
+	if (get_RXC_status(SENSOR_OUT_CH)==1)
 	{
 		xSemaphoreGiveFromISR(
 			RXC_CH1_Semaphore,
@@ -283,7 +350,7 @@ static uint32_t prvProcessRXCInterrupt(void)
 		);
 	}
 
-	if (get_RXC_status(PC_CH))
+	if (get_RXC_status(PC_CH)==1)
 	{
 		xSemaphoreGiveFromISR(
 			RXC_PC_Semaphore,
@@ -335,7 +402,7 @@ void main_demo(void) {
 	);
 
 	// QUEUES
-	LEDBar_Queue = xQueueCreate(2, sizeof(uint8_t));
+	
 	Sensor_Queue = xQueueCreate(10, sizeof(SensorData));
 	/* STEP 3: Create queue for temperature data */
 	Temperature_Queue = xQueueCreate(10, sizeof(TemperatureData));
@@ -343,10 +410,9 @@ void main_demo(void) {
 	LCD_Queue = xQueueCreate(1, sizeof(LCDData));
 
 	// TASKS 
-	/* xTaskCreate(SerialSend_Task, "STx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAL_SEND_PRI, NULL);	// SERIAL TRANSMITTER TASK */
+	
 	xTaskCreate(SensorTrigger_Task, "Trigger", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAL_SEND_PRI, NULL);
 	xTaskCreate(SerialReceive_Task, "SRx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAl_REC_PRI, NULL);	// SERIAL RECEIVER TASK 
-	r_point = 0;
 	xTaskCreate(LEDBar_Task, "ST", configMINIMAL_STACK_SIZE, NULL, SERVICE_TASK_PRI, NULL);				// CREATE LED BAR TASK  
 	xTaskCreate(TemperatureProcess_Task, "Temp", configMINIMAL_STACK_SIZE, NULL, TASK_TEMP_PROCESS_PRI, NULL);
 	xTaskCreate(PCReceive_Task, "PCRx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAl_REC_PRI, NULL);
@@ -360,7 +426,8 @@ void main_demo(void) {
 
 	// START SCHEDULER
 	vTaskStartScheduler();
-	while (1);
+	for (;;) {
+	}
 }
 
 // TASKS: IMPLEMENTATIONS
@@ -372,8 +439,9 @@ static void LEDBar_Task(void* pvParameters)
 	int8_t temp_outside = 0;
 
 	uint8_t alarm_state = 0U;
+	(void)pvParameters;
 
-	while (1)
+	for (;;)
 	{
 
 
@@ -389,6 +457,13 @@ static void LEDBar_Task(void* pvParameters)
 			else if (data.channel == SENSOR_OUT_CH)
 			{
 				temp_outside = data.temperature;
+			}
+			else
+			{
+				/*
+				 * Podaci sa drugih kanala se ne ocekuju
+				 * i namjerno se ignorisu.
+				 */
 			}
 
 			/* STEP 8: Display temperatures on LED bars */
@@ -435,16 +510,7 @@ static void LEDBar_Task(void* pvParameters)
 		vTaskDelay(pdMS_TO_TICKS(500));
 	}
 }
-static void SerialSend_Task(void* pvParameters) {
-	t_point = 0;
-	while (1) {
-		if (t_point > (sizeof(trigger) - 1))
-			t_point = 0;
-		send_serial_character(SENSOR_IN_CH, trigger[t_point++]);
-		xSemaphoreTake(TBE_BinarySemaphore, portMAX_DELAY);// kada se koristi predajni interapt
-		//vTaskDelay(pdMS_TO_TICKS(100));// kada se koristi vremenski delay
-	}
-}
+
 
 
 static void SerialReceive_Task(void* pvParameters)
@@ -455,8 +521,9 @@ static void SerialReceive_Task(void* pvParameters)
 
 
 	SensorData data;
+	(void)pvParameters;
 
-	while (1)
+	for (;;)
 	{
 		if (xSemaphoreTake(RXC_CH0_Semaphore, 0) == pdTRUE)
 		{
@@ -593,7 +660,14 @@ static void SerialReceive_Task(void* pvParameters)
 				digit_count_ch1 = 0;
 			}
 		}
-	}
+		else
+{
+/*
+ * Karakteri koji nisu cifra ili CR
+ * namjerno se ignorisu.
+ */
+}
+}
 }
 
 
@@ -612,7 +686,7 @@ static void TemperatureProcess_Task(void* pvParameters)
 
 	(void)pvParameters;
 
-	while (1)
+	for (;;)
 	{
 		if (xQueueReceive(
 			Sensor_Queue,
@@ -728,7 +802,7 @@ static void SensorTrigger_Task(void* pvParameters)
 {
 	(void)pvParameters;
 
-	while (1)
+	for (;;)
 	{
 		/* Kanal 0 */
 		send_serial_character(SENSOR_IN_CH, 'X');
@@ -766,7 +840,7 @@ static void PCReceive_Task(void* pvParameters)
 
 	(void)pvParameters;
 
-	while (1)
+	for (;;)
 	{
 		/* Cekamo da stigne bar jedan znak sa PC-a */
 		xSemaphoreTake(
@@ -885,6 +959,13 @@ static void PCReceive_Task(void* pvParameters)
 							);
 						}
 					}
+					else
+					{
+						/*
+						 * Nepodrzana komanda ne mijenja
+						 * konfiguraciju sistema.
+						 */
+					}
 
 					index = 0U;
 				}
@@ -916,7 +997,7 @@ static void TemperatureDisplay_Task(void* pvParameters)
 
 	(void)pvParameters;
 
-	while (1)
+	for (;;)
 	{
 		sprintf(
 			message,
@@ -944,7 +1025,7 @@ static void PCSend_Task(void* pvParameters)
 
 	(void)pvParameters;
 
-	while (1)
+	for (;;)
 	{
 		xQueueReceive(
 			PCSend_Queue,
@@ -1008,7 +1089,7 @@ static void LCDDisplay_Task(void* pvParameters)
 
 	(void)pvParameters;
 
-	while (1)
+	for (;;)
 	{
 		/*
 		 * LCD task ceka semafor koji tajmer
@@ -1140,8 +1221,8 @@ static void LCDDisplay_Task(void* pvParameters)
 				/*
 				 * Razlaganje vrijednosti na desetice i jedinice.
 				 */
-				digits[2] = (uint8_t)hexnum[value / 10U];
-				digits[3] = (uint8_t)hexnum[value % 10U];
+				digits[2] = hexnum[value / 10U];
+				digits[3] = hexnum[value % 10U];
 
 				/*
 				 * Upis sve cetiri cifre na Seg7Mux.
