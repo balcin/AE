@@ -1,10 +1,6 @@
 ﻿// STANDARD INCLUDES
-#include <stdio.h>l.g 
-#include <conio.h>
-#include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
-#include <math.h>
-
 // KERNEL INCLUDES
 #include "FreeRTOS.h"
 #include "task.h"
@@ -30,27 +26,41 @@
 #define TASK_LCD_PRI (tskIDLE_PRIORITY + 1)
 
 // TASKS: FORWARD DECLARATIONS 
-void LEDBar_Task(void* pvParameters);
-void SerialSend_Task(void* pvParameters);
-void SerialReceive_Task(void* pvParameters);
-void TemperatureProcess_Task(void* pvParameters);
-void SensorTrigger_Task(void* pvParameters);
-void PCReceive_Task(void* pvParameters);
-void PCSend_Task(void* pvParameters);
-void TemperatureDisplay_Task(void* pvParameters);
-void LCDDisplay_Task(void* pvParameters);
+/* Entry point used outside this file. */
+void main_demo(void);
+
+/* Functions used only inside main_application.c. */
+static void LEDBar_Task(void* pvParameters);
+static void SerialSend_Task(void* pvParameters);
+static void SerialReceive_Task(void* pvParameters);
+static void TemperatureProcess_Task(void* pvParameters);
+static void SensorTrigger_Task(void* pvParameters);
+static void PCReceive_Task(void* pvParameters);
+static void PCSend_Task(void* pvParameters);
+static void TemperatureDisplay_Task(void* pvParameters);
+static void LCDDisplay_Task(void* pvParameters);
+
 static void LCDTimerCallback(TimerHandle_t xTimer);
-int8_t CalculateTemperature(uint8_t resistance);
-uint8_t TemperatureToLEDPattern(int8_t temperature);
+
+static int8_t CalculateTemperature(uint8_t resistance);
+static uint8_t TemperatureToLEDPattern(int8_t temperature);
+static int8_t ParseTemperatureValue(
+	const char* command,
+	uint8_t start_index
+);
+static uint8_t CalculateAverage(
+	const uint8_t* values,
+	uint8_t count
+);
 
 // TRASNMISSION DATA - CONSTANT IN THIS APPLICATION 
-const char trigger[] = "XYZ";
-unsigned volatile t_point;
+static const char trigger[] = "XYZ";
+static volatile unsigned t_point;
 
 // RECEPTION DATA BUFFER - COM 0
 #define R_BUF_SIZE (32)
-uint8_t r_buffer[R_BUF_SIZE];
-unsigned volatile r_point;
+static uint8_t r_buffer[R_BUF_SIZE];
+static volatile unsigned r_point;
 
 
 // 7-SEG NUMBER DATABASE - ALL HEX DIGITS [ 0 1 2 3 4 5 6 7 8 9 A B C D E F ]
@@ -58,23 +68,23 @@ static const char hexnum[] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0
 
 
 // GLOBAL OS-HANDLES 
-SemaphoreHandle_t LED_INT_BinarySemaphore;
-SemaphoreHandle_t TBE_BinarySemaphore;
-SemaphoreHandle_t TBE_PC_BinarySemaphore;
-SemaphoreHandle_t TBE_CH1_BinarySemaphore;
-SemaphoreHandle_t RXC_CH0_Semaphore;
-SemaphoreHandle_t RXC_CH1_Semaphore;
-SemaphoreHandle_t RXC_PC_Semaphore;
-SemaphoreHandle_t LCD_BinarySemaphore;
+static SemaphoreHandle_t LED_INT_BinarySemaphore;
+static SemaphoreHandle_t TBE_BinarySemaphore;
+static SemaphoreHandle_t TBE_PC_BinarySemaphore;
+static SemaphoreHandle_t TBE_CH1_BinarySemaphore;
+static SemaphoreHandle_t RXC_CH0_Semaphore;
+static SemaphoreHandle_t RXC_CH1_Semaphore;
+static SemaphoreHandle_t RXC_PC_Semaphore;
+static SemaphoreHandle_t LCD_BinarySemaphore;
 
-QueueHandle_t LEDBar_Queue;
-QueueHandle_t Sensor_Queue;
+static QueueHandle_t LEDBar_Queue;
+static QueueHandle_t Sensor_Queue;
 /* STEP 2: Added queue for temperature data */
-QueueHandle_t Temperature_Queue;
-QueueHandle_t PCSend_Queue;
-QueueHandle_t LCD_Queue;
+static QueueHandle_t Temperature_Queue;
+static QueueHandle_t PCSend_Queue;
+static QueueHandle_t LCD_Queue;
 
-TimerHandle_t LCD_Timer;
+static TimerHandle_t LCD_Timer;
 
 // STRUCTURES
 typedef struct
@@ -100,37 +110,37 @@ typedef struct
 	int8_t temperature_outside;
 } LCDData;
 
-uint8_t sensor0_values[5];
-uint8_t sensor1_values[5];
+static uint8_t sensor0_values[5];
+static uint8_t sensor1_values[5];
 
-uint8_t index0 = 0;
-uint8_t index1 = 0;
+static uint8_t index0 = 0;
+static uint8_t index1 = 0;
 
-uint8_t sensor0_count = 0U;
-uint8_t sensor1_count = 0U;
+static uint8_t sensor0_count = 0U;
+static uint8_t sensor1_count = 0U;
 
-uint8_t average_resistance_ch0 = 0U;
-uint8_t average_resistance_ch1 = 0U;
+static uint8_t average_resistance_ch0 = 0U;
+static uint8_t average_resistance_ch1 = 0U;
 
-int8_t temperature_ch0 = 0;
-int8_t temperature_ch1 = 0;
+static int8_t temperature_ch0 = 0;
+static int8_t temperature_ch1 = 0;
 
-uint8_t resistance_ch0 = 0;
-uint8_t resistance_ch1 = 0;
+static uint8_t resistance_ch0 = 0;
+static uint8_t resistance_ch1 = 0;
 
-uint8_t digit_count_ch0 = 0;
-uint8_t digit_count_ch1 = 0;
+static uint8_t digit_count_ch0 = 0;
+static uint8_t digit_count_ch1 = 0;
 
 // SENSOR CALIBRATION
-int8_t sensor_min_temp = 20;
-int8_t sensor_max_temp = 50;
-int8_t temperature_high_limit = 100;
-int8_t temperature_low_limit = 10;
+static int8_t sensor_min_temp = 20;
+static int8_t sensor_max_temp = 50;
+static int8_t temperature_high_limit = 100;
+static int8_t temperature_low_limit = 10;
 
 #define SENSOR_MAX_RESISTANCE (71U)
 
 //FUNCTIONS
-int8_t CalculateTemperature(uint8_t resistance)
+static int8_t CalculateTemperature(uint8_t resistance)
 {
 	int16_t temperature;
 
@@ -149,7 +159,7 @@ int8_t CalculateTemperature(uint8_t resistance)
 	return (int8_t)temperature;
 }
 
-uint8_t TemperatureToLEDPattern(int8_t temperature)
+static uint8_t TemperatureToLEDPattern(int8_t temperature)
 {
 	uint8_t led_count;
 	uint8_t pattern;
@@ -179,7 +189,7 @@ uint8_t TemperatureToLEDPattern(int8_t temperature)
 	return pattern;
 }
 
-int8_t ParseTemperatureValue(const char* command, uint8_t start_index
+static int8_t ParseTemperatureValue(const char* command, uint8_t start_index
 )
 {
 	int16_t value = 0;
@@ -193,7 +203,7 @@ int8_t ParseTemperatureValue(const char* command, uint8_t start_index
 
 	return (int8_t)value;
 }
-uint8_t CalculateAverage(uint8_t* values, uint8_t count
+static uint8_t CalculateAverage(const uint8_t* values, uint8_t count
 )
 {
 	uint16_t sum = 0U;
@@ -354,7 +364,7 @@ void main_demo(void) {
 }
 
 // TASKS: IMPLEMENTATIONS
-void LEDBar_Task(void* pvParameters)
+static void LEDBar_Task(void* pvParameters)
 {
 	TemperatureData data;
 
@@ -425,7 +435,7 @@ void LEDBar_Task(void* pvParameters)
 		vTaskDelay(pdMS_TO_TICKS(500));
 	}
 }
-void SerialSend_Task(void* pvParameters) {
+static void SerialSend_Task(void* pvParameters) {
 	t_point = 0;
 	while (1) {
 		if (t_point > (sizeof(trigger) - 1))
@@ -437,7 +447,7 @@ void SerialSend_Task(void* pvParameters) {
 }
 
 
-void SerialReceive_Task(void* pvParameters)
+static void SerialReceive_Task(void* pvParameters)
 {
 	uint8_t cc = 0;
 	uint8_t channel;
@@ -587,7 +597,7 @@ void SerialReceive_Task(void* pvParameters)
 }
 
 
-void TemperatureProcess_Task(void* pvParameters)
+static void TemperatureProcess_Task(void* pvParameters)
 {
 	SensorData data;
 	TemperatureData temperature_data;
@@ -714,7 +724,7 @@ void TemperatureProcess_Task(void* pvParameters)
 	}
 }
 
-void SensorTrigger_Task(void* pvParameters)
+static void SensorTrigger_Task(void* pvParameters)
 {
 	(void)pvParameters;
 
@@ -748,7 +758,7 @@ void SensorTrigger_Task(void* pvParameters)
 }
 
 
-void PCReceive_Task(void* pvParameters)
+static void PCReceive_Task(void* pvParameters)
 {
 	uint8_t cc;
 	char command[32];
@@ -900,7 +910,7 @@ void PCReceive_Task(void* pvParameters)
 }
 
 
-void TemperatureDisplay_Task(void* pvParameters)
+static void TemperatureDisplay_Task(void* pvParameters)
 {
 	char message[32];
 
@@ -927,7 +937,7 @@ void TemperatureDisplay_Task(void* pvParameters)
 	}
 }
 
-void PCSend_Task(void* pvParameters)
+static void PCSend_Task(void* pvParameters)
 {
 	char message[32];
 	uint8_t i;
@@ -971,7 +981,7 @@ static void LCDTimerCallback(TimerHandle_t xTimer)
 	}
 }
 
-void LCDDisplay_Task(void* pvParameters)
+static void LCDDisplay_Task(void* pvParameters)
 {
 	LCDData lcd_data =
 	{
