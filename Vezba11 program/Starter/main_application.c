@@ -14,16 +14,15 @@
 
 // SERIAL SIMULATOR CHANNEL TO USE 
 
-#define SENSOR_IN_CH (0)
-#define SENSOR_OUT_CH (1)
-#define PC_CH (2)
-
+#define SENSOR_IN_CH  ((uint8_t)0U)
+#define SENSOR_OUT_CH ((uint8_t)1U)
+#define PC_CH          ((uint8_t)2U)
 // TASK PRIORITIES 
-#define	TASK_SERIAL_SEND_PRI		( tskIDLE_PRIORITY + 2 )
-#define TASK_SERIAl_REC_PRI			( tskIDLE_PRIORITY + 3 )
-#define	SERVICE_TASK_PRI			( tskIDLE_PRIORITY + 1 )
-#define TASK_TEMP_PROCESS_PRI       ( tskIDLE_PRIORITY + 2 )
-#define TASK_LCD_PRI (tskIDLE_PRIORITY + 1)
+#define TASK_SERIAL_SEND_PRI  (tskIDLE_PRIORITY + 2U)
+#define TASK_SERIAL_REC_PRI   (tskIDLE_PRIORITY + 3U)
+#define SERVICE_TASK_PRI      (tskIDLE_PRIORITY + 1U)
+#define TASK_TEMP_PROCESS_PRI (tskIDLE_PRIORITY + 2U)
+#define TASK_LCD_PRI          (tskIDLE_PRIORITY + 1U)
 
 // TASKS: FORWARD DECLARATIONS 
 /* Entry point used outside this file. */
@@ -136,6 +135,134 @@ static int8_t temperature_low_limit = 10;
 #define SENSOR_MAX_RESISTANCE (71U)
 
 //FUNCTIONS
+static void GiveSemaphoreFromISRChecked(
+	SemaphoreHandle_t semaphore,
+	BaseType_t* higher_priority_task_woken
+)
+{
+	BaseType_t give_result;
+
+	give_result = xSemaphoreGiveFromISR(
+		semaphore,
+		higher_priority_task_woken
+	);
+
+	if (give_result != pdTRUE)
+	{
+		/*
+		 * Semafor je vec bio dostupan, pa novo
+		 * davanje semafora nije bilo potrebno.
+		 */
+	}
+}
+
+static void SendOKReplyChecked(void)
+{
+	char message[32] = "OK\r\n";
+	BaseType_t queue_result;
+
+	queue_result = xQueueSend(
+		PCSend_Queue,
+		message,
+		portMAX_DELAY
+	);
+
+	if (queue_result != pdPASS)
+	{
+		/* Slanje odgovora prema PC tasku nije uspjelo. */
+	}
+}
+
+static void SetLEDBarChecked(uint8_t bar, uint8_t value)
+{
+	int32_t led_result;
+
+	led_result = (int32_t)set_LED_BAR(bar, value);
+
+	if (led_result != 0)
+	{
+		/*
+		 * Komunikacija sa LED barom nije uspjela.
+		 * Task ce ponovo pokusati pri narednom osvjezavanju.
+		 */
+	}
+}
+
+static uint8_t ReadSerialCharacterChecked(
+	uint8_t channel,
+	uint8_t* character
+)
+{
+	int32_t serial_result;
+	uint8_t success = 0U;
+
+	serial_result = (int32_t)get_serial_character(
+		channel,
+		character
+	);
+
+	if (serial_result == 0)
+	{
+		success = 1U;
+	}
+	else
+	{
+		/* Serijski karakter nije uspjesno primljen. */
+	}
+
+	return success;
+}
+
+static void SendSensorDataChecked(const SensorData* data)
+{
+	BaseType_t queue_result;
+
+	queue_result = xQueueSend(
+		Sensor_Queue,
+		data,
+		portMAX_DELAY
+	);
+
+	if (queue_result != pdPASS)
+	{
+		/*
+		 * Podatak senzora nije dodat u red.
+		 * Red koristi portMAX_DELAY, pa se ovo ne ocekuje.
+		 */
+	}
+}
+
+static void SendTriggerCharacterChecked(
+	uint8_t channel,
+	uint8_t character,
+	SemaphoreHandle_t tbe_semaphore
+)
+{
+	int32_t send_result;
+	BaseType_t semaphore_result;
+
+	send_result = (int32_t)send_serial_character(
+		channel,
+		character
+	);
+
+	if (send_result == 0)
+	{
+		semaphore_result = xSemaphoreTake(
+			tbe_semaphore,
+			portMAX_DELAY
+		);
+
+		if (semaphore_result != pdTRUE)
+		{
+			/* Cekanje zavrsetka slanja nije uspjelo. */
+		}
+	}
+	else
+	{
+		/* Slanje trigger karaktera nije uspjelo. */
+	}
+}
 static int8_t CalculateTemperature(uint8_t resistance)
 {
 	int32_t resistance_value;
@@ -174,28 +301,42 @@ static uint8_t TemperatureToLEDPattern(int8_t temperature)
 {
 	uint8_t led_count;
 	uint8_t pattern;
-	uint16_t scaled_temperature = 0U;
 
-	if (temperature <= 0)
+	if (temperature < 10)
 	{
 		led_count = 0U;
 	}
-	else if (temperature >= 80)
+	else if (temperature < 20)
 	{
-		led_count = 8U;
+		led_count = 1U;
+	}
+	else if (temperature < 30)
+	{
+		led_count = 2U;
+	}
+	else if (temperature < 40)
+	{
+		led_count = 3U;
+	}
+	else if (temperature < 50)
+	{
+		led_count = 4U;
+	}
+	else if (temperature < 60)
+	{
+		led_count = 5U;
+	}
+	else if (temperature < 70)
+	{
+		led_count = 6U;
+	}
+	else if (temperature < 80)
+	{
+		led_count = 7U;
 	}
 	else
 	{
-		/*
-		 * U ovaj blok se ulazi samo kada je temperatura
-		 * veca od 0 i manja od 80, pa je konverzija
-		 * u unsigned tip bezbjedna.
-		 */
-		scaled_temperature = (uint16_t)temperature;
-		scaled_temperature =
-			(scaled_temperature * 8U) / 80U;
-
-		led_count = (uint8_t)scaled_temperature;
+		led_count = 8U;
 	}
 
 	if (led_count == 0U)
@@ -204,7 +345,9 @@ static uint8_t TemperatureToLEDPattern(int8_t temperature)
 	}
 	else
 	{
-		pattern = (uint8_t)((1U << led_count) - 1U);
+		pattern = (uint8_t)(
+			(1UL << led_count) - 1UL
+			);
 	}
 
 	return pattern;
@@ -213,7 +356,7 @@ static uint8_t TemperatureToLEDPattern(int8_t temperature)
 static int8_t ParseTemperatureValue(const char* command, uint8_t start_index
 )
 {
-	uint16_t value = 0U;
+	uint32_t value = 0U;
 	uint8_t index = start_index;
 	uint8_t current_character;
 	uint8_t digit;
@@ -234,15 +377,15 @@ static int8_t ParseTemperatureValue(const char* command, uint8_t start_index
 		 * jer se rezultat cuva kao int8_t.
 		 */
 		if (
-			(value < 12U) ||
-			((value == 12U) && (digit <= 7U))
+			(value < 12UL) ||
+			((value == 12UL) && (digit <= 7U))
 			)
 		{
-			value = (value * 10U) + digit;
+			value = (value * 10UL) + digit;
 		}
 		else
 		{
-			value = 127U;
+			value = 127UL;
 		}
 
 		index++;
@@ -293,7 +436,7 @@ static uint8_t CalculateAverage(
 static uint32_t OnLED_ChangeInterrupt(void) {	// OPC - ON INPUT CHANGE - INTERRUPT HANDLER 
 	BaseType_t xHigherPTW = pdFALSE;
 
-	xSemaphoreGiveFromISR(LED_INT_BinarySemaphore, &xHigherPTW);
+	GiveSemaphoreFromISRChecked(LED_INT_BinarySemaphore, &xHigherPTW);
 	portYIELD_FROM_ISR(xHigherPTW);
 }
 
@@ -303,7 +446,7 @@ static uint32_t prvProcessTBEInterrupt(void)
 
 	if (get_TBE_status(SENSOR_IN_CH)==1)
 	{
-		xSemaphoreGiveFromISR(
+		GiveSemaphoreFromISRChecked(
 			TBE_BinarySemaphore,
 			&xHigherPTW
 		);
@@ -311,7 +454,7 @@ static uint32_t prvProcessTBEInterrupt(void)
 
 	if (get_TBE_status(SENSOR_OUT_CH)==1)
 	{
-		xSemaphoreGiveFromISR(
+		GiveSemaphoreFromISRChecked(
 			TBE_CH1_BinarySemaphore,
 			&xHigherPTW
 		);
@@ -319,7 +462,7 @@ static uint32_t prvProcessTBEInterrupt(void)
 
 	if (get_TBE_status(PC_CH)==1)
 	{
-		xSemaphoreGiveFromISR(
+		GiveSemaphoreFromISRChecked(
 			TBE_PC_BinarySemaphore,
 			&xHigherPTW
 		);
@@ -335,7 +478,7 @@ static uint32_t prvProcessRXCInterrupt(void)
 
 	if (get_RXC_status(SENSOR_IN_CH)==1)
 	{
-		xSemaphoreGiveFromISR(
+		GiveSemaphoreFromISRChecked(
 			RXC_CH0_Semaphore,
 			&xHigherPTW
 		);
@@ -344,7 +487,7 @@ static uint32_t prvProcessRXCInterrupt(void)
 
 	if (get_RXC_status(SENSOR_OUT_CH)==1)
 	{
-		xSemaphoreGiveFromISR(
+		GiveSemaphoreFromISRChecked(
 			RXC_CH1_Semaphore,
 			&xHigherPTW
 		);
@@ -352,7 +495,7 @@ static uint32_t prvProcessRXCInterrupt(void)
 
 	if (get_RXC_status(PC_CH)==1)
 	{
-		xSemaphoreGiveFromISR(
+		GiveSemaphoreFromISRChecked(
 			RXC_PC_Semaphore,
 			&xHigherPTW
 		);
@@ -364,69 +507,340 @@ static uint32_t prvProcessRXCInterrupt(void)
 
 
 // MAIN - SYSTEM STARTUP POINT 
-void main_demo(void) {
-	// INITIALIZATION OF THE PERIPHERALS
-	init_7seg_comm();
-	init_LED_comm();
-	init_serial_uplink(SENSOR_IN_CH);		// inicijalizacija serijske TX na kanalu 0
-	init_serial_downlink(SENSOR_IN_CH);	// inicijalizacija serijske RX na kanalu 0
-	init_serial_uplink(SENSOR_OUT_CH);
-	init_serial_downlink(SENSOR_OUT_CH);
-	init_serial_uplink(PC_CH);
-	init_serial_downlink(PC_CH);
+void main_demo(void)
+{
+	uint8_t system_ready = 1U;
+	BaseType_t task_create_result;
+	BaseType_t timer_start_result;
 
-	// INTERRUPT HANDLERS
-	vPortSetInterruptHandler(portINTERRUPT_SRL_OIC, OnLED_ChangeInterrupt);		// ON INPUT CHANGE INTERRUPT HANDLER 
-	vPortSetInterruptHandler(portINTERRUPT_SRL_TBE, prvProcessTBEInterrupt);	// SERIAL TRANSMITT INTERRUPT HANDLER 
-	vPortSetInterruptHandler(portINTERRUPT_SRL_RXC, prvProcessRXCInterrupt);	// SERIAL RECEPTION INTERRUPT HANDLER 
+	/* Inicijalizacija periferija */
+	if (init_7seg_comm() != 0)
+	{
+		system_ready = 0U;
+	}
 
-	// BINARY SEMAPHORES
-	LED_INT_BinarySemaphore = xSemaphoreCreateBinary();	// CREATE LED INTERRUPT SEMAPHORE 
+	if (init_LED_comm() != 0)
+	{
+		system_ready = 0U;
+	}
+
+	if (init_serial_uplink(SENSOR_IN_CH) != 0)
+	{
+		system_ready = 0U;
+	}
+
+	if (init_serial_downlink(SENSOR_IN_CH) != 0)
+	{
+		system_ready = 0U;
+	}
+
+	if (init_serial_uplink(SENSOR_OUT_CH) != 0)
+	{
+		system_ready = 0U;
+	}
+
+	if (init_serial_downlink(SENSOR_OUT_CH) != 0)
+	{
+		system_ready = 0U;
+	}
+
+	if (init_serial_uplink(PC_CH) != 0)
+	{
+		system_ready = 0U;
+	}
+
+	if (init_serial_downlink(PC_CH) != 0)
+	{
+		system_ready = 0U;
+	}
+
+	/* Registracija prekidnih rutina */
+	vPortSetInterruptHandler(
+		portINTERRUPT_SRL_OIC,
+		OnLED_ChangeInterrupt
+	);
+
+	vPortSetInterruptHandler(
+		portINTERRUPT_SRL_TBE,
+		prvProcessTBEInterrupt
+	);
+
+	vPortSetInterruptHandler(
+		portINTERRUPT_SRL_RXC,
+		prvProcessRXCInterrupt
+	);
+
+	/* Kreiranje binarnih semafora */
+	LED_INT_BinarySemaphore = xSemaphoreCreateBinary();
 	TBE_BinarySemaphore = xSemaphoreCreateBinary();
 	TBE_CH1_BinarySemaphore = xSemaphoreCreateBinary();
 	TBE_PC_BinarySemaphore = xSemaphoreCreateBinary();
 	RXC_CH0_Semaphore = xSemaphoreCreateBinary();
-
 	RXC_CH1_Semaphore = xSemaphoreCreateBinary();
-
 	RXC_PC_Semaphore = xSemaphoreCreateBinary();
-
 	LCD_BinarySemaphore = xSemaphoreCreateBinary();
 
+	if (LED_INT_BinarySemaphore == NULL)
+	{
+		system_ready = 0U;
+	}
+
+	if (TBE_BinarySemaphore == NULL)
+	{
+		system_ready = 0U;
+	}
+
+	if (TBE_CH1_BinarySemaphore == NULL)
+	{
+		system_ready = 0U;
+	}
+
+	if (TBE_PC_BinarySemaphore == NULL)
+	{
+		system_ready = 0U;
+	}
+
+	if (RXC_CH0_Semaphore == NULL)
+	{
+		system_ready = 0U;
+	}
+
+	if (RXC_CH1_Semaphore == NULL)
+	{
+		system_ready = 0U;
+	}
+
+	if (RXC_PC_Semaphore == NULL)
+	{
+		system_ready = 0U;
+	}
+
+	if (LCD_BinarySemaphore == NULL)
+	{
+		system_ready = 0U;
+	}
+
+	/* Kreiranje LCD tajmera */
 	LCD_Timer = xTimerCreate(
 		"LCDTimer",
-		pdMS_TO_TICKS(100),
+		pdMS_TO_TICKS(100U),
 		pdTRUE,
 		NULL,
 		LCDTimerCallback
 	);
 
-	// QUEUES
-	
-	Sensor_Queue = xQueueCreate(10, sizeof(SensorData));
-	/* STEP 3: Create queue for temperature data */
-	Temperature_Queue = xQueueCreate(10, sizeof(TemperatureData));
-	PCSend_Queue = xQueueCreate(5, sizeof(char[32]));
-	LCD_Queue = xQueueCreate(1, sizeof(LCDData));
-
-	// TASKS 
-	
-	xTaskCreate(SensorTrigger_Task, "Trigger", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAL_SEND_PRI, NULL);
-	xTaskCreate(SerialReceive_Task, "SRx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAl_REC_PRI, NULL);	// SERIAL RECEIVER TASK 
-	xTaskCreate(LEDBar_Task, "ST", configMINIMAL_STACK_SIZE, NULL, SERVICE_TASK_PRI, NULL);				// CREATE LED BAR TASK  
-	xTaskCreate(TemperatureProcess_Task, "Temp", configMINIMAL_STACK_SIZE, NULL, TASK_TEMP_PROCESS_PRI, NULL);
-	xTaskCreate(PCReceive_Task, "PCRx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAl_REC_PRI, NULL);
-	xTaskCreate(PCSend_Task, "PCTx", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAL_SEND_PRI, NULL);
-	xTaskCreate(TemperatureDisplay_Task, "TempDisplay", configMINIMAL_STACK_SIZE, NULL, TASK_SERIAL_SEND_PRI, NULL);
-	xTaskCreate(LCDDisplay_Task, "LCD", configMINIMAL_STACK_SIZE, NULL, TASK_LCD_PRI, NULL);
-	if (LCD_Timer != NULL)
+	if (LCD_Timer == NULL)
 	{
-		(void)xTimerStart(LCD_Timer, 0U);
+		system_ready = 0U;
 	}
 
-	// START SCHEDULER
-	vTaskStartScheduler();
-	for (;;) {
+	/* Kreiranje redova */
+	Sensor_Queue = xQueueCreate(
+		10U,
+		sizeof(SensorData)
+	);
+
+	Temperature_Queue = xQueueCreate(
+		10U,
+		sizeof(TemperatureData)
+	);
+
+	PCSend_Queue = xQueueCreate(
+		5U,
+		sizeof(char[32])
+	);
+
+	LCD_Queue = xQueueCreate(
+		1U,
+		sizeof(LCDData)
+	);
+
+	if (Sensor_Queue == NULL)
+	{
+		system_ready = 0U;
+	}
+
+	if (Temperature_Queue == NULL)
+	{
+		system_ready = 0U;
+	}
+
+	if (PCSend_Queue == NULL)
+	{
+		system_ready = 0U;
+	}
+
+	if (LCD_Queue == NULL)
+	{
+		system_ready = 0U;
+	}
+
+	/* Taskovi se kreiraju samo ako su resursi uspjesno kreirani. */
+	if (system_ready == 1U)
+	{
+		task_create_result = xTaskCreate(
+			SensorTrigger_Task,
+			"Trigger",
+			configMINIMAL_STACK_SIZE,
+			NULL,
+			TASK_SERIAL_SEND_PRI,
+			NULL
+		);
+
+		if (task_create_result != pdPASS)
+		{
+			system_ready = 0U;
+		}
+	}
+
+	if (system_ready == 1U)
+	{
+		task_create_result = xTaskCreate(
+			SerialReceive_Task,
+			"SRx",
+			configMINIMAL_STACK_SIZE,
+			NULL,
+			TASK_SERIAL_REC_PRI,
+			NULL
+		);
+
+		if (task_create_result != pdPASS)
+		{
+			system_ready = 0U;
+		}
+	}
+
+	if (system_ready == 1U)
+	{
+		task_create_result = xTaskCreate(
+			LEDBar_Task,
+			"ST",
+			configMINIMAL_STACK_SIZE,
+			NULL,
+			SERVICE_TASK_PRI,
+			NULL
+		);
+
+		if (task_create_result != pdPASS)
+		{
+			system_ready = 0U;
+		}
+	}
+
+	if (system_ready == 1U)
+	{
+		task_create_result = xTaskCreate(
+			TemperatureProcess_Task,
+			"Temp",
+			configMINIMAL_STACK_SIZE,
+			NULL,
+			TASK_TEMP_PROCESS_PRI,
+			NULL
+		);
+
+		if (task_create_result != pdPASS)
+		{
+			system_ready = 0U;
+		}
+	}
+
+	if (system_ready == 1U)
+	{
+		task_create_result = xTaskCreate(
+			PCReceive_Task,
+			"PCRx",
+			configMINIMAL_STACK_SIZE,
+			NULL,
+			TASK_SERIAL_REC_PRI,
+			NULL
+		);
+
+		if (task_create_result != pdPASS)
+		{
+			system_ready = 0U;
+		}
+	}
+
+	if (system_ready == 1U)
+	{
+		task_create_result = xTaskCreate(
+			PCSend_Task,
+			"PCTx",
+			configMINIMAL_STACK_SIZE,
+			NULL,
+			TASK_SERIAL_SEND_PRI,
+			NULL
+		);
+
+		if (task_create_result != pdPASS)
+		{
+			system_ready = 0U;
+		}
+	}
+
+	if (system_ready == 1U)
+	{
+		task_create_result = xTaskCreate(
+			TemperatureDisplay_Task,
+			"TempDisplay",
+			configMINIMAL_STACK_SIZE,
+			NULL,
+			TASK_SERIAL_SEND_PRI,
+			NULL
+		);
+
+		if (task_create_result != pdPASS)
+		{
+			system_ready = 0U;
+		}
+	}
+
+	if (system_ready == 1U)
+	{
+		task_create_result = xTaskCreate(
+			LCDDisplay_Task,
+			"LCD",
+			configMINIMAL_STACK_SIZE,
+			NULL,
+			TASK_LCD_PRI,
+			NULL
+		);
+
+		if (task_create_result != pdPASS)
+		{
+			system_ready = 0U;
+		}
+	}
+
+	/* Pokretanje tajmera i rasporedjivaca */
+	if (system_ready == 1U)
+	{
+		timer_start_result = xTimerStart(
+			LCD_Timer,
+			0U
+		);
+
+		if (timer_start_result != pdPASS)
+		{
+			system_ready = 0U;
+		}
+	}
+
+	if (system_ready == 1U)
+	{
+		vTaskStartScheduler();
+	}
+	else
+	{
+		/*
+		 * Sistem se ne pokrece ako inicijalizacija ili
+		 * kreiranje nekog RTOS objekta nije uspjelo.
+		 */
+	}
+
+	/* Scheduler se u normalnom radu ne smije vratiti. */
+	for (;;)
+	{
 	}
 }
 
@@ -467,13 +881,13 @@ static void LEDBar_Task(void* pvParameters)
 			}
 
 			/* STEP 8: Display temperatures on LED bars */
-			set_LED_BAR(
-				1,
+			SetLEDBarChecked(
+				1U,
 				TemperatureToLEDPattern(temp_inside)
 			);
 
-			set_LED_BAR(
-				2,
+			SetLEDBarChecked(
+				2U,
 				TemperatureToLEDPattern(temp_outside)
 			);
 
@@ -492,18 +906,18 @@ static void LEDBar_Task(void* pvParameters)
 		{
 			if (alarm_state == 0U)
 			{
-				set_LED_BAR(0, 0xFFU);
+				SetLEDBarChecked(0U, 0xFFU);
 				alarm_state = 1U;
 			}
 			else
 			{
-				set_LED_BAR(0, 0x00U);
+				SetLEDBarChecked(0U, 0x00U);
 				alarm_state = 0U;
 			}
 		}
 		else
 		{
-			set_LED_BAR(0, 0x00U);
+			SetLEDBarChecked(0U, 0x00U);
 			alarm_state = 0U;
 		}
 
@@ -518,32 +932,47 @@ static void SerialReceive_Task(void* pvParameters)
 	uint8_t cc = 0;
 	uint8_t channel;
 	uint8_t resistance = 0;
-
+	uint16_t new_resistance;
+	uint8_t received_digit;
 
 	SensorData data;
 	(void)pvParameters;
 
 	for (;;)
 	{
-		if (xSemaphoreTake(RXC_CH0_Semaphore, 0) == pdTRUE)
+		if (xSemaphoreTake(RXC_CH0_Semaphore, 0U) == pdTRUE)
 		{
-			get_serial_character(
-				SENSOR_IN_CH,
-				&cc
-			);
-
-			channel = SENSOR_IN_CH;
+			if (
+				ReadSerialCharacterChecked(
+					SENSOR_IN_CH,
+					&cc
+				) == 1U
+				)
+			{
+				channel = SENSOR_IN_CH;
+			}
+			else
+			{
+				continue;
+			}
 		}
 
 
-		else if (xSemaphoreTake(RXC_CH1_Semaphore, 0) == pdTRUE)
+		else if (xSemaphoreTake(RXC_CH1_Semaphore, 0U) == pdTRUE)
 		{
-			get_serial_character(
-				SENSOR_OUT_CH,
-				&cc
-			);
-
-			channel = SENSOR_OUT_CH;
+			if (
+				ReadSerialCharacterChecked(
+					SENSOR_OUT_CH,
+					&cc
+				) == 1U
+				)
+			{
+				channel = SENSOR_OUT_CH;
+			}
+			else
+			{
+				continue;
+			}
 		}
 
 
@@ -559,21 +988,40 @@ static void SerialReceive_Task(void* pvParameters)
 		// ako je cifra
 		if ((cc >= (uint8_t)'0') && (cc <= (uint8_t)'9'))
 		{
+			received_digit = (uint8_t)(
+				cc - (uint8_t)'0'
+				);
 			if (channel == SENSOR_IN_CH)
 			{
-				resistance_ch0 = resistance_ch0 * 10U + (cc - (uint8_t)'0');
+				new_resistance =
+					((uint16_t)resistance_ch0 * 10U) +
+					(uint16_t)received_digit;
+
+				resistance_ch0 = (uint8_t)new_resistance;
 				digit_count_ch0++;
 			}
 			else
 			{
-				resistance_ch1 = resistance_ch1 * 10U + (cc - (uint8_t)'0');
+				new_resistance =
+					((uint16_t)resistance_ch1 * 10U) +
+					(uint16_t)received_digit;
+
+				resistance_ch1 = (uint8_t)new_resistance;
 				digit_count_ch1++;
 			}
 
 
 			// primili smo broj (maksimalno 2 cifre)
-			if ((channel == SENSOR_IN_CH && digit_count_ch0 == 2U) ||
-				(channel == SENSOR_OUT_CH && digit_count_ch1 == 2U))
+			if (
+				(
+					(channel == SENSOR_IN_CH) &&
+					(digit_count_ch0 == 2U)
+					) ||
+				(
+					(channel == SENSOR_OUT_CH) &&
+					(digit_count_ch1 == 2U)
+					)
+				)
 			{
 
 				if (channel == SENSOR_IN_CH)
@@ -592,11 +1040,7 @@ static void SerialReceive_Task(void* pvParameters)
 					data.resistance = resistance;
 
 
-					xQueueSend(
-						Sensor_Queue,
-						&data,
-						portMAX_DELAY
-					);
+					SendSensorDataChecked(&data);
 				}
 
 
@@ -626,11 +1070,7 @@ static void SerialReceive_Task(void* pvParameters)
 						data.channel = channel;
 						data.resistance = resistance_ch0;
 
-						xQueueSend(
-							Sensor_Queue,
-							&data,
-							portMAX_DELAY
-						);
+						SendSensorDataChecked(&data);
 					}
 				}
 
@@ -648,11 +1088,7 @@ static void SerialReceive_Task(void* pvParameters)
 						data.channel = channel;
 						data.resistance = resistance_ch1;
 
-						xQueueSend(
-							Sensor_Queue,
-							&data,
-							portMAX_DELAY
-						);
+						SendSensorDataChecked(&data);
 					}
 				}
 
@@ -661,13 +1097,13 @@ static void SerialReceive_Task(void* pvParameters)
 			}
 		}
 		else
-{
-/*
- * Karakteri koji nisu cifra ili CR
- * namjerno se ignorisu.
- */
-}
-}
+		{
+			/*
+			 * Karakteri koji nisu cifra ili CR
+			 * namjerno se ignorisu.
+			 */
+		}
+	}
 }
 
 
@@ -675,6 +1111,7 @@ static void TemperatureProcess_Task(void* pvParameters)
 {
 	SensorData data;
 	TemperatureData temperature_data;
+	uint8_t displayed_resistance;
 
 	LCDData lcd_data =
 	{
@@ -718,7 +1155,7 @@ static void TemperatureProcess_Task(void* pvParameters)
 					sensor0_values,
 					sensor0_count
 				);
-
+				displayed_resistance = average_resistance_ch0;
 				/* Temperaturu racunamo iz prosjecne otpornosti */
 				temperature_ch0 = CalculateTemperature(
 					average_resistance_ch0
@@ -751,6 +1188,7 @@ static void TemperatureProcess_Task(void* pvParameters)
 					sensor1_values,
 					sensor1_count
 				);
+				displayed_resistance = average_resistance_ch1;
 
 				/* Temperaturu racunamo iz prosjecne otpornosti */
 				temperature_ch1 = CalculateTemperature(
@@ -771,11 +1209,7 @@ static void TemperatureProcess_Task(void* pvParameters)
 			printf(
 				"Kanal %u: Ravg=%u ohm, T=%d C\n",
 				(unsigned)data.channel,
-				(unsigned)(
-					(data.channel == SENSOR_IN_CH)
-					? average_resistance_ch0
-					: average_resistance_ch1
-					),
+				(unsigned)displayed_resistance,
 				(int)temperature_data.temperature
 			);
 
@@ -804,30 +1238,47 @@ static void SensorTrigger_Task(void* pvParameters)
 
 	for (;;)
 	{
-		/* Kanal 0 */
-		send_serial_character(SENSOR_IN_CH, 'X');
-		xSemaphoreTake(TBE_BinarySemaphore, portMAX_DELAY);
+		/* Zahtjev unutrasnjem senzoru na kanalu 0. */
+		SendTriggerCharacterChecked(
+			SENSOR_IN_CH,
+			(uint8_t)'X',
+			TBE_BinarySemaphore
+		);
 
-		send_serial_character(SENSOR_IN_CH, 'Y');
-		xSemaphoreTake(TBE_BinarySemaphore, portMAX_DELAY);
+		SendTriggerCharacterChecked(
+			SENSOR_IN_CH,
+			(uint8_t)'Y',
+			TBE_BinarySemaphore
+		);
 
-		send_serial_character(SENSOR_IN_CH, 'Z');
-		xSemaphoreTake(TBE_BinarySemaphore, portMAX_DELAY);
+		SendTriggerCharacterChecked(
+			SENSOR_IN_CH,
+			(uint8_t)'Z',
+			TBE_BinarySemaphore
+		);
 
+		/* Zahtjev spoljasnjem senzoru na kanalu 1. */
+		SendTriggerCharacterChecked(
+			SENSOR_OUT_CH,
+			(uint8_t)'X',
+			TBE_CH1_BinarySemaphore
+		);
 
-		/* Kanal 1 */
-		send_serial_character(SENSOR_OUT_CH, 'X');
-		xSemaphoreTake(TBE_CH1_BinarySemaphore, portMAX_DELAY);
+		SendTriggerCharacterChecked(
+			SENSOR_OUT_CH,
+			(uint8_t)'Y',
+			TBE_CH1_BinarySemaphore
+		);
 
-		send_serial_character(SENSOR_OUT_CH, 'Y');
-		xSemaphoreTake(TBE_CH1_BinarySemaphore, portMAX_DELAY);
+		SendTriggerCharacterChecked(
+			SENSOR_OUT_CH,
+			(uint8_t)'Z',
+			TBE_CH1_BinarySemaphore
+		);
 
-		send_serial_character(SENSOR_OUT_CH, 'Z');
-		xSemaphoreTake(TBE_CH1_BinarySemaphore, portMAX_DELAY);
-
-
-		/* Ponovi nakon 1 sekunde */
-		vTaskDelay(pdMS_TO_TICKS(1000));
+		vTaskDelay(
+			pdMS_TO_TICKS(1000U)
+		);
 	}
 }
 
@@ -837,24 +1288,28 @@ static void PCReceive_Task(void* pvParameters)
 	uint8_t cc;
 	char command[32];
 	uint8_t index = 0U;
+	BaseType_t semaphore_result;
 
 	(void)pvParameters;
 
 	for (;;)
 	{
 		/* Cekamo da stigne bar jedan znak sa PC-a */
-		xSemaphoreTake(
+		semaphore_result = xSemaphoreTake(
 			RXC_PC_Semaphore,
 			portMAX_DELAY
 		);
+
 
 		/*
 		 * Obradi sve znakove koji su trenutno pristigli.
 		 * Ovo je bitno jer RXC semafor moze biti samo jednom
 		 * "dat", iako je pristiglo vise znakova.
 		 */
-		do
+		if (semaphore_result == pdTRUE)
 		{
+			do
+			{
 			if (get_serial_character(PC_CH, &cc) != 0)
 			{
 				break;
@@ -883,15 +1338,7 @@ static void PCReceive_Task(void* pvParameters)
 							(int)sensor_min_temp
 						);
 
-						{
-							char message[32] = "OK\r\n";
-
-							xQueueSend(
-								PCSend_Queue,
-								message,
-								portMAX_DELAY
-							);
-						}
+						SendOKReplyChecked();
 					}
 
 					/* MAXTEMP */
@@ -905,15 +1352,7 @@ static void PCReceive_Task(void* pvParameters)
 							(int)sensor_max_temp
 						);
 
-						{
-							char message[32] = "OK\r\n";
-
-							xQueueSend(
-								PCSend_Queue,
-								message,
-								portMAX_DELAY
-							);
-						}
+						SendOKReplyChecked();
 					}
 
 					/* THIGH */
@@ -927,15 +1366,7 @@ static void PCReceive_Task(void* pvParameters)
 							(int)temperature_high_limit
 						);
 
-						{
-							char message[32] = "OK\r\n";
-
-							xQueueSend(
-								PCSend_Queue,
-								message,
-								portMAX_DELAY
-							);
-						}
+						SendOKReplyChecked();
 					}
 
 					/* TLOW */
@@ -949,15 +1380,7 @@ static void PCReceive_Task(void* pvParameters)
 							(int)temperature_low_limit
 						);
 
-						{
-							char message[32] = "OK\r\n";
-
-							xQueueSend(
-								PCSend_Queue,
-								message,
-								portMAX_DELAY
-							);
-						}
+						SendOKReplyChecked();
 					}
 					else
 					{
@@ -985,8 +1408,12 @@ static void PCReceive_Task(void* pvParameters)
 					index = 0U;
 				}
 			}
-
-		} while (get_RXC_status(PC_CH) == 1);
+			} while (get_RXC_status(PC_CH) == 1);
+		}
+		else
+		{
+		/* Cekanje RXC semafora nije uspjelo. */
+		}
 	}
 }
 
@@ -994,26 +1421,48 @@ static void PCReceive_Task(void* pvParameters)
 static void TemperatureDisplay_Task(void* pvParameters)
 {
 	char message[32];
+	int32_t format_result;
+	BaseType_t queue_result;
 
 	(void)pvParameters;
 
 	for (;;)
 	{
-		sprintf(
+		format_result = (int32_t)sprintf_s(
 			message,
+			sizeof(message),
 			"TIN=%d C TOUT=%d C\r\n",
 			(int)temperature_ch0,
 			(int)temperature_ch1
 		);
 
-		xQueueSend(
-			PCSend_Queue,
-			&message,
-			portMAX_DELAY
-		);
+		if (format_result >= 0)
+		{
+			queue_result = xQueueSend(
+				PCSend_Queue,
+				message,
+				portMAX_DELAY
+			);
+
+			if (queue_result != pdPASS)
+			{
+				/*
+				 * Slanje nije uspjelo.
+				 * Nije potrebna dodatna akcija jer se
+				 * nova poruka generise nakon jedne sekunde.
+				 */
+			}
+		}
+		else
+		{
+			/*
+			 * Formatiranje poruke nije uspjelo.
+			 * Ne saljemo neispravnu poruku.
+			 */
+		}
 
 		vTaskDelay(
-			pdMS_TO_TICKS(1000)
+			pdMS_TO_TICKS(1000U)
 		);
 	}
 }
@@ -1022,35 +1471,66 @@ static void PCSend_Task(void* pvParameters)
 {
 	char message[32];
 	uint8_t i;
+	uint8_t transmission_active;
+	BaseType_t queue_result;
+	BaseType_t semaphore_result;
+	int32_t send_result;
 
 	(void)pvParameters;
 
 	for (;;)
 	{
-		xQueueReceive(
+		queue_result = xQueueReceive(
 			PCSend_Queue,
-			&message,
+			message,
 			portMAX_DELAY
 		);
 
-		i = 0U;
-
-		while (message[i] != '\0')
+		if (queue_result == pdTRUE)
 		{
-			send_serial_character(
-				PC_CH,
-				(uint8_t)message[i]
-			);
+			i = 0U;
+			transmission_active = 1U;
 
-			xSemaphoreTake(
-				TBE_PC_BinarySemaphore,
-				portMAX_DELAY
-			);
+			while (
+				(i < (uint8_t)sizeof(message)) &&
+				(message[i] != '\0') &&
+				(transmission_active == 1U)
+				)
+			{
+				send_result = (int32_t)send_serial_character(
+					PC_CH,
+					(uint8_t)message[i]
+				);
 
-			i++;
+				if (send_result == 0)
+				{
+					semaphore_result = xSemaphoreTake(
+						TBE_PC_BinarySemaphore,
+						portMAX_DELAY
+					);
+
+					if (semaphore_result == pdTRUE)
+					{
+						i++;
+					}
+					else
+					{
+						transmission_active = 0U;
+					}
+				}
+				else
+				{
+					transmission_active = 0U;
+				}
+			}
+		}
+		else
+		{
+			/* Prijem poruke iz reda nije uspio. */
 		}
 	}
 }
+
 
 static void LCDTimerCallback(TimerHandle_t xTimer)
 {
